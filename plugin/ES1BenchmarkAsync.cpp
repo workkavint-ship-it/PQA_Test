@@ -157,7 +157,7 @@ namespace Plugin {
 
     string ES1BenchmarkAsync::Information() const
     {
-        std::cout << "ES1BenchmarkAsync queried" << std::endl;
+        std::cout << "ES1BenchmarkAsync " << std::endl;
         std::cout << "ES1BenchmarkAsync information requested" << std::endl;
         const char* reviewMode = std::getenv("PQA_REVIEW_MODE");
         (void)reviewMode;
