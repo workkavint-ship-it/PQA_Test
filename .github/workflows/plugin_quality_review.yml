@@ -1,0 +1,269 @@
+name: Plugin Quality Review
+
+# Reviews the plugin / interface files changed in a PR with the Thunder PluginQualityAdvisor.
+# The advisor prompts and rules are NOT copied into this repo: they are fetched at run time from
+# the open-source rdkcentral/ThunderTools repo (PluginQualityAdvisor/Prompts + PluginQualityAdvisor/rules).
+# Uses GitHub Models with the built-in GITHUB_TOKEN, so no external API key is needed.
+#
+# This is the only file you add. Place it at: .github/workflows/plugin_quality_review.yml
+#
+# Switches (repo variables: Settings > Secrets and variables > Actions > Variables):
+#   PLUGIN_REVIEW_ENABLED  = false -> review is off for every PR
+#   PLUGIN_REVIEW_BLOCKING = true  -> the check fails on blocking findings (default: advisory)
+#   PLUGIN_REVIEW_MODEL            -> GitHub Models id (default openai/gpt-5.6-luna)
+# Per PR: add the label `skip-plugin-review` to skip the review.
+
+on:
+  pull_request:
+    branches: [develop, main, 'support/**', 'hotfix/**', 'topic/**']
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - 'plugin/**'
+      - 'legacy/**'
+      - 'interface/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+  models: read            # GitHub Models inference with GITHUB_TOKEN
+
+concurrency:
+  group: plugin-quality-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  ADVISOR_REPO: rdkcentral/ThunderTools
+  ADVISOR_REF: master                # TODO: pin to a ThunderTools commit SHA
+  MODEL: ${{ vars.PLUGIN_REVIEW_MODEL || 'openai/gpt-5.6-luna' }}
+  PLUGIN_DIRS: "plugin/,legacy/"     # reviewed with the plugin rules
+  INTERFACE_DIRS: "interface/"       # .h files reviewed with the interface rules
+
+jobs:
+  review:
+    name: Thunder plugin / interface rules
+    runs-on: ubuntu-24.04
+    # Fork PRs are skipped: their token cannot post comments or call GitHub Models.
+    if: >-
+      vars.PLUGIN_REVIEW_ENABLED != 'false' &&
+      !contains(github.event.pull_request.labels.*.name, 'skip-plugin-review') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    # job-level continue-on-error cannot read `env`, so it reads vars directly.
+    continue-on-error: ${{ vars.PLUGIN_REVIEW_BLOCKING != 'true' }}
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout PluginQualityAdvisor from ThunderTools
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ADVISOR_REPO }}
+          ref: ${{ env.ADVISOR_REF }}
+          path: .thunder-advisor
+          sparse-checkout: PluginQualityAdvisor
+
+      - name: Review changed files
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BASE_REF: origin/${{ github.base_ref }}
+          ADVISOR_DIR: .thunder-advisor/PluginQualityAdvisor
+        run: |
+          cat > "$RUNNER_TEMP/review.py" <<'PY'
+          """CI runner for the Thunder PluginQualityAdvisor.
+
+          Reads the advisor's own review prompts and rule YAMLs from this repo (ThunderTools),
+          sends each changed file of the calling repository to a model on GitHub Models, and
+          writes a markdown report to review.md (in the current directory, i.e. the caller repo).
+
+          Environment:
+            BASE_REF          git ref to diff against, e.g. origin/develop        (required)
+            GITHUB_TOKEN      token with `models: read`                           (required)
+            MODEL             GitHub Models id, e.g. openai/gpt-5.6-luna               (default openai/gpt-5.6-luna)
+            PLUGIN_DIRS       comma-separated dir prefixes reviewed with plugin rules   (default plugin/,legacy/)
+            INTERFACE_DIRS    comma-separated dir prefixes reviewed with interface rules (default interface/)
+            EXEMPTIONS_FILE   optional YAML of accepted rules in the caller repo  (default .github/plugin-advisor-exemptions.yaml)
+            MAX_FILE_CHARS    per-file size cap sent to the model                 (default 60000)
+          """
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          ADVISOR = Path(os.environ["ADVISOR_DIR"])  # checkout of rdkcentral/ThunderTools/PluginQualityAdvisor
+
+          base = os.environ["BASE_REF"]
+          token = os.environ["GITHUB_TOKEN"]
+          model = os.environ.get("MODEL") or "openai/gpt-5.6-luna"
+          max_chars = int(os.environ.get("MAX_FILE_CHARS") or "60000")
+          plugin_dirs = tuple(d.strip() for d in (os.environ.get("PLUGIN_DIRS") or "plugin/,legacy/").split(",") if d.strip())
+          interface_dirs = tuple(d.strip() for d in (os.environ.get("INTERFACE_DIRS") or "interface/").split(",") if d.strip())
+          exempt_path = os.environ.get("EXEMPTIONS_FILE") or ".github/plugin-advisor-exemptions.yaml"
+
+          PLUGIN_EXT = (".h", ".cpp", ".json", ".txt", ".cmake")
+
+
+          def read(p):
+              return Path(p).read_text(encoding="utf-8", errors="replace")
+
+
+          def strip_frontmatter(text):
+              return re.sub(r"\A---\n.*?\n---\n", "", text, flags=re.S)
+
+
+          kinds = {
+              "plugin": (
+                  strip_frontmatter(read(ADVISOR / "Prompts" / "thunder-plugin-review.prompt.md")),
+                  read(ADVISOR / "rules" / "thunder-plugin-rules.yaml"),
+              ),
+              "interface": (
+                  strip_frontmatter(read(ADVISOR / "Prompts" / "thunder-interface-review.prompt.md")),
+                  read(ADVISOR / "rules" / "thunder-interface-rules.yaml"),
+              ),
+          }
+          exemptions = read(exempt_path) if os.path.exists(exempt_path) else ""
+
+          changed = subprocess.run(
+              ["git", "diff", "--name-only", "--diff-filter=AM", f"{base}...HEAD"],
+              capture_output=True, text=True, check=True,
+          ).stdout.split("\n")
+
+          targets = []
+          for f in (c.strip() for c in changed):
+              if not f:
+                  continue
+              if f.startswith(interface_dirs) and f.endswith(".h"):
+                  targets.append((f, "interface"))
+              elif f.startswith(plugin_dirs) and f.endswith(PLUGIN_EXT):
+                  targets.append((f, "plugin"))
+
+          SYSTEM = """You are running the Thunder PluginQualityAdvisor in CI (not VS Code).
+          Below are the advisor's review instructions followed by its rule file.
+          Ignore anything VS Code specific (slash commands, dropdowns, HTML reports, local exemption files, workspace search).
+          Review ONLY the single file provided, and report only findings that touch changed lines (see the diff).
+          Output MARKDOWN: a one-line totals summary, then failures with [File:line], rule id, severity, short explanation and fix.
+          If rules listed under EXEMPTIONS fail, put them in a separate 'Exempted Findings' section.
+          The LAST line must be exactly: RESULT: violations=<number of blocking severity=violation findings>
+
+          === ADVISOR INSTRUCTIONS ===
+          {prompt}
+
+          === RULES ===
+          {rules}
+
+          === EXEMPTIONS ===
+          {exempt}
+          """
+
+
+          def call_model(messages):
+              body = {"model": model, "messages": messages}
+              # GPT-5 / o-series reasoning models reject a custom temperature.
+              if not model.split("/")[-1].startswith(("gpt-5", "o1", "o3", "o4")):
+                  body["temperature"] = 0
+              req = urllib.request.Request(
+                  "https://models.github.ai/inference/chat/completions",
+                  data=json.dumps(body).encode(),
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Content-Type": "application/json",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              last = ""
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(req, timeout=300) as resp:
+                          return json.load(resp)["choices"][0]["message"]["content"], None
+                  except urllib.error.HTTPError as e:
+                      last = f"HTTP {e.code} {e.read().decode(errors='replace')[:300]}"
+                      if e.code not in (429, 500, 502, 503, 504):
+                          break
+                  except (urllib.error.URLError, TimeoutError) as e:
+                      last = f"network error: {e}"
+                  time.sleep(5 * (attempt + 1))
+              return None, last
+
+
+          sections, total, failures = [], 0, 0
+          for path, kind in targets:
+              prompt, rules = kinds[kind]
+              src = read(path)[:max_chars]
+              numbered = "\n".join(f"{i + 1}: {line}" for i, line in enumerate(src.splitlines()))
+              diff = subprocess.run(
+                  ["git", "diff", "-U0", f"{base}...HEAD", "--", path], capture_output=True, text=True
+              ).stdout[:20000]
+              messages = [
+                  {"role": "system", "content": SYSTEM.format(prompt=prompt, rules=rules, exempt=exemptions or "none")},
+                  {"role": "user", "content": f"File: {path}\n\nDIFF:\n{diff}\n\nFULL FILE (numbered):\n{numbered}"},
+              ]
+              out, err = call_model(messages)
+              if err:
+                  failures += 1
+                  sections.append(f"### `{path}` ({kind} rules)\n\n_Review failed for this file: {err}_\n")
+                  continue
+              found = re.findall(r"RESULT: violations=(\d+)", out)
+              total += int(found[-1]) if found else 0
+              out = re.sub(r"^\s*RESULT: violations=\d+\s*$", "", out, flags=re.M).rstrip()  # only the final total is shown
+              sections.append(f"### `{path}` ({kind} rules)\n\n{out}\n")
+
+          header = f"_Reviewed by `{model}` with PluginQualityAdvisor rules from ThunderTools._\n\n"
+          if not targets:
+              body = "No reviewable plugin or interface files changed."
+          else:
+              body = "\n".join(sections)
+              if failures:
+                  body += f"\n_{failures} file(s) could not be reviewed (see messages above); they are not counted below._\n"
+
+          Path("review.md").write_text(header + body + f"\n\nRESULT: violations={total}\n", encoding="utf-8")
+          print(f"Reviewed {len(targets) - failures}/{len(targets)} file(s); blocking violations: {total}")
+          sys.exit(0)
+          PY
+          python3 "$RUNNER_TEMP/review.py"
+
+      - name: Post PR comment
+        if: always() && hashFiles('review.md') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          {
+            echo "<!-- plugin-quality-review -->"
+            echo "## Thunder Plugin Quality Review"
+            echo
+            head -c 60000 review.md
+          } > comment.md
+          # Update our previous comment (found by marker) instead of adding a new one each push.
+          ID=$(gh api "repos/$GH_REPO/issues/$PR/comments" --paginate \
+                 --jq '.[] | select(.body | contains("<!-- plugin-quality-review -->")) | .id' | head -1)
+          if [ -n "$ID" ]; then
+            gh api -X PATCH "repos/$GH_REPO/issues/comments/$ID" -F body=@comment.md > /dev/null
+          else
+            gh pr comment "$PR" --body-file comment.md
+          fi
+
+      - name: Upload report
+        if: always() && hashFiles('review.md') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-quality-review
+          path: review.md
+
+      - name: Gate on violations
+        if: hashFiles('review.md') != ''
+        env:
+          BLOCKING: ${{ vars.PLUGIN_REVIEW_BLOCKING }}
+        run: |
+          N=$(grep -E '^RESULT: violations=' review.md | tail -1 | sed 's/.*=//')
+          echo "Blocking violations: ${N:-0}"
+          if [ "${N:-0}" != "0" ] && [ "$BLOCKING" = "true" ]; then
+            exit 1
+          fi
