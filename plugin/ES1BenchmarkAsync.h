@@ -21,6 +21,8 @@ namespace Plugin {
 
         ES1BenchmarkAsync(const ES1BenchmarkAsync&) = delete;
         ES1BenchmarkAsync& operator=(const ES1BenchmarkAsync&) = delete;
+        ES1BenchmarkAsync(ES1BenchmarkAsync&&) = delete;
+        ES1BenchmarkAsync& operator=(ES1BenchmarkAsync&&) = delete;
 
         class Config : public Core::JSON::Container {
         public:
