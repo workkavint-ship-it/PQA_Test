@@ -1,0 +1,13 @@
+autostart = "@PLUGIN_ES1BENCHMARKASYNC_AUTOSTART@"
+
+configuration = {
+	"root": {
+		"mode": "@PLUGIN_ES1BENCHMARKASYNC_MODE@",
+		"locator": "lib@PLUGIN_IMPLEMENTATION@.so",
+		"threads": 4
+	},
+	"notifyhost": "127.0.0.1",
+	"notifyport": 8080,
+	"thunderhost": "127.0.0.1",
+	"thunderport": 9998
+}
