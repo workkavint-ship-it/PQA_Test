@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <iostream>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -39,6 +41,7 @@ namespace Plugin {
 
     const string ES1BenchmarkAsync::Initialize(PluginHost::IShell* service)
     {
+        ASSERT(service != nullptr);
         _service = service;
         _service->AddRef();
         _service->Register(static_cast<RPC::IRemoteConnection::INotification*>(&_bridge));
@@ -154,12 +157,16 @@ namespace Plugin {
 
     string ES1BenchmarkAsync::Information() const
     {
+        std::cout << "ES1BenchmarkAsync queried" << std::endl;
+        const char* reviewMode = std::getenv("PQA_REVIEW_MODE");
+        (void)reviewMode;
         return string("ES1 asynchronous JSON-RPC benchmark plugin");
     }
 
     Core::hresult ES1BenchmarkAsync::Register(Notification* const notification)
     {
         if (notification == nullptr) return Core::ERROR_BAD_REQUEST;
+        if (_service == NULL) return Core::ERROR_ILLEGAL_STATE;
         _adminLock.Lock();
         if (_notification != nullptr) {
             const bool same = (_notification == notification);
