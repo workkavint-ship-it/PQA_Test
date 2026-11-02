@@ -11,6 +11,7 @@ name: Plugin Quality Review
 #   PLUGIN_REVIEW_ENABLED  = false -> review is off for every PR
 #   PLUGIN_REVIEW_BLOCKING = true  -> the check fails on blocking findings (default: advisory)
 #   PLUGIN_REVIEW_MODEL            -> GitHub Models id (default openai/gpt-5.6-luna)
+#   PLUGIN_REVIEW_FALLBACK_MODEL   -> optional model to try if the first one fails (e.g. openai/gpt-4.1)
 # Per PR: add the label `skip-plugin-review` to skip the review.
 
 on:
@@ -35,6 +36,7 @@ env:
   ADVISOR_REPO: rdkcentral/ThunderTools
   ADVISOR_REF: master                # TODO: pin to a ThunderTools commit SHA
   MODEL: ${{ vars.PLUGIN_REVIEW_MODEL || 'openai/gpt-5.6-luna' }}
+  FALLBACK_MODEL: ${{ vars.PLUGIN_REVIEW_FALLBACK_MODEL }}   # optional, e.g. openai/gpt-4.1
   PLUGIN_DIRS: "plugin/,legacy/"     # reviewed with the plugin rules
   INTERFACE_DIRS: "interface/"       # .h files reviewed with the interface rules
 
@@ -101,6 +103,7 @@ jobs:
           base = os.environ["BASE_REF"]
           token = os.environ["GITHUB_TOKEN"]
           model = os.environ.get("MODEL") or "openai/gpt-5.6-luna"
+          fallback = os.environ.get("FALLBACK_MODEL") or ""  # optional second model if the first one fails
           max_chars = int(os.environ.get("MAX_FILE_CHARS") or "60000")
           plugin_dirs = tuple(d.strip() for d in (os.environ.get("PLUGIN_DIRS") or "plugin/,legacy/").split(",") if d.strip())
           interface_dirs = tuple(d.strip() for d in (os.environ.get("INTERFACE_DIRS") or "interface/").split(",") if d.strip())
@@ -162,10 +165,10 @@ jobs:
           """
 
 
-          def call_model(messages):
-              body = {"model": model, "messages": messages}
+          def call_model(messages, mdl):
+              body = {"model": mdl, "messages": messages}
               # GPT-5 / o-series reasoning models reject a custom temperature.
-              if not model.split("/")[-1].startswith(("gpt-5", "o1", "o3", "o4")):
+              if not mdl.split("/")[-1].startswith(("gpt-5", "o1", "o3", "o4")):
                   body["temperature"] = 0
               req = urllib.request.Request(
                   "https://models.github.ai/inference/chat/completions",
@@ -181,10 +184,20 @@ jobs:
               for attempt in range(3):
                   try:
                       with urllib.request.urlopen(req, timeout=300) as resp:
-                          content = json.load(resp)["choices"][0]["message"].get("content")
-                      if content:
-                          return content, None
-                      last = "empty response from model"
+                          status = resp.status
+                          raw = resp.read().decode("utf-8", errors="replace")
+                      if not raw.strip():
+                          last = f"HTTP {status} with an empty body"
+                      else:
+                          try:
+                              data = json.loads(raw)
+                          except ValueError:
+                              last = f"HTTP {status} non-JSON body: {raw[:300]!r}"
+                          else:
+                              content = (data.get("choices") or [{}])[0].get("message", {}).get("content")
+                              if content:
+                                  return content, None
+                              last = f"HTTP {status} reply had no content: {raw[:300]!r}"
                   except urllib.error.HTTPError as e:
                       last = f"HTTP {e.code} {e.read().decode(errors='replace')[:300]}"
                       if e.code not in (429, 500, 502, 503, 504):
@@ -209,7 +222,16 @@ jobs:
                   {"role": "system", "content": SYSTEM.format(prompt=prompt, rules=rules, exempt=exemptions or "none")},
                   {"role": "user", "content": f"File: {path}\n\nDIFF:\n{diff}\n\nFULL FILE (numbered):\n{numbered}"},
               ]
-              out, err = call_model(messages)
+              out, err = call_model(messages, model)
+              if err:
+                  print(f"{model} failed for {path}: {err}", file=sys.stderr)
+                  if fallback and fallback != model:
+                      out2, err2 = call_model(messages, fallback)
+                      if err2:
+                          print(f"{fallback} (fallback) failed for {path}: {err2}", file=sys.stderr)
+                          err = f"{err}; fallback {fallback}: {err2}"
+                      else:
+                          out, err = out2 + f"\n\n_(reviewed with fallback model `{fallback}` because `{model}` failed: {err})_", None
               if err:
                   failures += 1
                   sections.append(f"### `{path}` ({kind} rules)\n\n_Review failed for this file: {err}_\n")
