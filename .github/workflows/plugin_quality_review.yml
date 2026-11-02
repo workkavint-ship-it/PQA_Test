@@ -181,13 +181,18 @@ jobs:
               for attempt in range(3):
                   try:
                       with urllib.request.urlopen(req, timeout=300) as resp:
-                          return json.load(resp)["choices"][0]["message"]["content"], None
+                          content = json.load(resp)["choices"][0]["message"].get("content")
+                      if content:
+                          return content, None
+                      last = "empty response from model"
                   except urllib.error.HTTPError as e:
                       last = f"HTTP {e.code} {e.read().decode(errors='replace')[:300]}"
                       if e.code not in (429, 500, 502, 503, 504):
                           break
                   except (urllib.error.URLError, TimeoutError) as e:
                       last = f"network error: {e}"
+                  except Exception as e:  # unexpected response shape, connection reset while reading, ...
+                      last = f"{type(e).__name__}: {e}"
                   time.sleep(5 * (attempt + 1))
               return None, last
 
@@ -226,7 +231,20 @@ jobs:
           print(f"Reviewed {len(targets) - failures}/{len(targets)} file(s); blocking violations: {total}")
           sys.exit(0)
           PY
-          python3 "$RUNNER_TEMP/review.py"
+          # If the script crashes, still produce review.md so the PR comment shows why.
+          if ! python3 "$RUNNER_TEMP/review.py" 2> >(tee "$RUNNER_TEMP/err.txt" >&2); then
+            sleep 1
+            {
+              echo "_The review script crashed. Last lines of its error output:_"
+              echo
+              echo '```'
+              tail -n 20 "$RUNNER_TEMP/err.txt"
+              echo '```'
+              echo
+              echo "RESULT: violations=0"
+            } > review.md
+            exit 1
+          fi
 
       - name: Post PR comment
         if: always() && hashFiles('review.md') != ''
