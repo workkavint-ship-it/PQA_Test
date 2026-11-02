@@ -3,15 +3,16 @@ name: Plugin Quality Review
 # Reviews the plugin / interface files changed in a PR with the Thunder PluginQualityAdvisor.
 # The advisor prompts and rules are NOT copied into this repo: they are fetched at run time from
 # the open-source rdkcentral/ThunderTools repo (PluginQualityAdvisor/Prompts + PluginQualityAdvisor/rules).
-# Uses GitHub Models with the built-in GITHUB_TOKEN, so no external API key is needed.
+# Uses GitHub Copilot CLI, authenticated by the built-in GITHUB_TOKEN (permission copilot-requests: write),
+# so no secret or API key is needed. (GitHub Models, used by an earlier version, was retired on 2026-07-30.)
 #
 # This is the only file you add. Place it at: .github/workflows/plugin_quality_review.yml
 #
 # Switches (repo variables: Settings > Secrets and variables > Actions > Variables):
 #   PLUGIN_REVIEW_ENABLED  = false -> review is off for every PR
 #   PLUGIN_REVIEW_BLOCKING = true  -> the check fails on blocking findings (default: advisory)
-#   PLUGIN_REVIEW_MODEL            -> GitHub Models id (default openai/gpt-5.6-luna)
-#   PLUGIN_REVIEW_FALLBACK_MODEL   -> optional model to try if the first one fails (e.g. openai/gpt-4.1)
+#   PLUGIN_REVIEW_MODEL            -> Copilot CLI model id (default gpt-5.6-luna)
+#   PLUGIN_REVIEW_FALLBACK_MODEL   -> optional model to try if the first one fails (e.g. gpt-5.6-terra)
 # Per PR: add the label `skip-plugin-review` to skip the review.
 
 on:
@@ -26,7 +27,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  models: read            # GitHub Models inference with GITHUB_TOKEN
+  copilot-requests: write # lets Copilot CLI use the workflow's GITHUB_TOKEN
 
 concurrency:
   group: plugin-quality-${{ github.event.pull_request.number }}
@@ -35,8 +36,8 @@ concurrency:
 env:
   ADVISOR_REPO: rdkcentral/ThunderTools
   ADVISOR_REF: master                # TODO: pin to a ThunderTools commit SHA
-  MODEL: ${{ vars.PLUGIN_REVIEW_MODEL || 'openai/gpt-5.6-luna' }}
-  FALLBACK_MODEL: ${{ vars.PLUGIN_REVIEW_FALLBACK_MODEL }}   # optional, e.g. openai/gpt-4.1
+  MODEL: ${{ vars.PLUGIN_REVIEW_MODEL || 'gpt-5.6-luna' }}
+  FALLBACK_MODEL: ${{ vars.PLUGIN_REVIEW_FALLBACK_MODEL }}   # optional, e.g. gpt-5.6-terra
   PLUGIN_DIRS: "plugin/,legacy/"     # reviewed with the plugin rules
   INTERFACE_DIRS: "interface/"       # .h files reviewed with the interface rules
 
@@ -44,7 +45,7 @@ jobs:
   review:
     name: Thunder plugin / interface rules
     runs-on: ubuntu-24.04
-    # Fork PRs are skipped: their token cannot post comments or call GitHub Models.
+    # Fork PRs are skipped: their token cannot post comments or use Copilot CLI.
     if: >-
       vars.PLUGIN_REVIEW_ENABLED != 'false' &&
       !contains(github.event.pull_request.labels.*.name, 'skip-plugin-review') &&
@@ -66,23 +67,36 @@ jobs:
           path: .thunder-advisor
           sparse-checkout: PluginQualityAdvisor
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install GitHub Copilot CLI
+        env:
+          COPILOT_AUTO_UPDATE: "false"
+        run: |
+          npm install -g @github/copilot
+          copilot --version || true
+
       - name: Review changed files
         env:
           GITHUB_TOKEN: ${{ github.token }}
           BASE_REF: origin/${{ github.base_ref }}
           ADVISOR_DIR: .thunder-advisor/PluginQualityAdvisor
+          COPILOT_AUTO_UPDATE: "false"
         run: |
           cat > "$RUNNER_TEMP/review.py" <<'PY'
           """CI runner for the Thunder PluginQualityAdvisor.
 
           Reads the advisor's own review prompts and rule YAMLs from this repo (ThunderTools),
-          sends each changed file of the calling repository to a model on GitHub Models, and
+          sends each changed file of the calling repository to GitHub Copilot CLI, and
           writes a markdown report to review.md (in the current directory, i.e. the caller repo).
 
           Environment:
             BASE_REF          git ref to diff against, e.g. origin/develop        (required)
-            GITHUB_TOKEN      token with `models: read`                           (required)
-            MODEL             GitHub Models id, e.g. openai/gpt-5.6-luna               (default openai/gpt-5.6-luna)
+            GITHUB_TOKEN      workflow token, needs `copilot-requests: write`     (required)
+            MODEL             Copilot CLI model id, e.g. gpt-5.6-luna              (default gpt-5.6-luna)
             PLUGIN_DIRS       comma-separated dir prefixes reviewed with plugin rules   (default plugin/,legacy/)
             INTERFACE_DIRS    comma-separated dir prefixes reviewed with interface rules (default interface/)
             EXEMPTIONS_FILE   optional YAML of accepted rules in the caller repo  (default .github/plugin-advisor-exemptions.yaml)
@@ -102,7 +116,7 @@ jobs:
 
           base = os.environ["BASE_REF"]
           token = os.environ["GITHUB_TOKEN"]
-          model = os.environ.get("MODEL") or "openai/gpt-5.6-luna"
+          model = os.environ.get("MODEL") or "gpt-5.6-luna"
           fallback = os.environ.get("FALLBACK_MODEL") or ""  # optional second model if the first one fails
           max_chars = int(os.environ.get("MAX_FILE_CHARS") or "60000")
           plugin_dirs = tuple(d.strip() for d in (os.environ.get("PLUGIN_DIRS") or "plugin/,legacy/").split(",") if d.strip())
@@ -150,6 +164,7 @@ jobs:
           Below are the advisor's review instructions followed by its rule file.
           Ignore anything VS Code specific (slash commands, dropdowns, HTML reports, local exemption files, workspace search).
           Review ONLY the single file provided, and report only findings that touch changed lines (see the diff).
+          Do not call any tools or read other files: everything you need is in this message.
           Output MARKDOWN: a one-line totals summary, then failures with [File:line], rule id, severity, short explanation and fix.
           If rules listed under EXEMPTIONS fail, put them in a separate 'Exempted Findings' section.
           The LAST line must be exactly: RESULT: violations=<number of blocking severity=violation findings>
@@ -166,45 +181,26 @@ jobs:
 
 
           def call_model(messages, mdl):
-              body = {"model": mdl, "messages": messages}
-              # GPT-5 / o-series reasoning models reject a custom temperature.
-              if not mdl.split("/")[-1].startswith(("gpt-5", "o1", "o3", "o4")):
-                  body["temperature"] = 0
-              req = urllib.request.Request(
-                  "https://models.github.ai/inference/chat/completions",
-                  data=json.dumps(body).encode(),
-                  headers={
-                      "Authorization": f"Bearer {token}",
-                      "Content-Type": "application/json",
-                      "Accept": "application/vnd.github+json",
-                      "X-GitHub-Api-Version": "2022-11-28",
-                  },
-              )
+              """Run one review through GitHub Copilot CLI (authenticated by the workflow's GITHUB_TOKEN).
+
+              The prompt goes in on stdin. No tools are allowed, so the CLI can only answer with text
+              (non-interactive runs deny every action that is not pre-approved).
+              """
+              prompt = "\n\n".join(m["content"] for m in messages)
+              cmd = ["copilot", "-s", "--no-ask-user", "--model", mdl]
               last = ""
-              for attempt in range(3):
+              for attempt in range(2):
                   try:
-                      with urllib.request.urlopen(req, timeout=300) as resp:
-                          status = resp.status
-                          raw = resp.read().decode("utf-8", errors="replace")
-                      if not raw.strip():
-                          last = f"HTTP {status} with an empty body"
-                      else:
-                          try:
-                              data = json.loads(raw)
-                          except ValueError:
-                              last = f"HTTP {status} non-JSON body: {raw[:300]!r}"
-                          else:
-                              content = (data.get("choices") or [{}])[0].get("message", {}).get("content")
-                              if content:
-                                  return content, None
-                              last = f"HTTP {status} reply had no content: {raw[:300]!r}"
-                  except urllib.error.HTTPError as e:
-                      last = f"HTTP {e.code} {e.read().decode(errors='replace')[:300]}"
-                      if e.code not in (429, 500, 502, 503, 504):
-                          break
-                  except (urllib.error.URLError, TimeoutError) as e:
-                      last = f"network error: {e}"
-                  except Exception as e:  # unexpected response shape, connection reset while reading, ...
+                      r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=900)
+                      if r.returncode == 0 and r.stdout.strip():
+                          return r.stdout.strip(), None
+                      tail = (r.stderr or r.stdout or "").strip()[-400:]
+                      last = f"copilot exited {r.returncode}" + (f": {tail}" if tail else " with no output")
+                  except subprocess.TimeoutExpired:
+                      last = "copilot timed out after 900s"
+                  except FileNotFoundError:
+                      return None, "copilot CLI is not installed"
+                  except Exception as e:
                       last = f"{type(e).__name__}: {e}"
                   time.sleep(5 * (attempt + 1))
               return None, last
@@ -241,7 +237,7 @@ jobs:
               out = re.sub(r"^\s*RESULT: violations=\d+\s*$", "", out, flags=re.M).rstrip()  # only the final total is shown
               sections.append(f"### `{path}` ({kind} rules)\n\n{out}\n")
 
-          header = f"_Reviewed by `{model}` with PluginQualityAdvisor rules from ThunderTools._\n\n"
+          header = f"_Reviewed by `{model}` via GitHub Copilot CLI, using PluginQualityAdvisor rules from ThunderTools._\n\n"
           if not targets:
               body = "No reviewable plugin or interface files changed."
           else:
